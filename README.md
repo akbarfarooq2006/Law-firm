@@ -16,7 +16,7 @@ Pakistan — Next.js App Router + Supabase + streaming AI legal assistant.
 
 ```bash
 npm install
-cp .env.example .env.local   # fill in your keys (or leave empty for demo mode)
+# Create .env.local only when connecting Supabase or a live AI provider.
 npm run dev
 ```
 
@@ -24,7 +24,13 @@ Open http://localhost:3000.
 
 > The site runs fully in **demo mode** without any env vars: blog articles come from
 > bundled seeds, forms simulate success, and the chatbot streams keyword-based canned
-> answers. Add Supabase + OpenAI keys to go live.
+> answers. Add the variables described in [Configuration](docs/ARCHITECTURE.md#configuration)
+> to connect production services.
+
+## Documentation
+
+- [Architecture and operations](docs/ARCHITECTURE.md) — runtime flows, routes, data model,
+  configuration, security boundaries and deployment notes.
 
 ## Supabase Setup
 
