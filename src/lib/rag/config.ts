@@ -9,7 +9,7 @@ export const EMBEDDING_DIMENSIONS = Number(process.env.GEMINI_EMBEDDING_DIMENSIO
 export const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? "";
 export const GEMINI_BASE_URL =
   process.env.GEMINI_BASE_URL ?? "https://generativelanguage.googleapis.com/v1beta/openai/";
-export const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-3.6-flash";
+export const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-3.5-flash";
 export const GEMINI_GUARDRAIL_MODEL =
   process.env.GEMINI_GUARDRAIL_MODEL ?? "gemini-3.5-flash-lite";
 export const GEMINI_EMBEDDING_MODEL =
