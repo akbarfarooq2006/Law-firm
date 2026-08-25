@@ -12,7 +12,7 @@ export const legalAssistantAgent = new Agent({
   inputGuardrails: [scopeGuardrail],
   modelSettings: {
     temperature: 0.3,
-    maxTokens: 250,
+    maxTokens: 200,
     // Cap Gemini's hidden thinking tokens for routine FAQ-style answers.
     // Raise only if a future feature genuinely needs deeper reasoning.
     reasoning: { effort: GEMINI_REASONING_EFFORT as "minimal" | "low" | "medium" | "high" },

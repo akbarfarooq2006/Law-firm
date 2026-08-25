@@ -67,19 +67,19 @@ async function* demoStream(reply: string): AsyncGenerator<Uint8Array> {
 
 type TurnContext = { sessionId: string; lastUser: string };
 
+const GUARDRAIL_REFUSAL =
+  "I'm the Karachi Legal AI assistant for Rizvi Law Associates, so I can only help with legal-information questions about Pakistani law and this firm's services — fees, practice areas, procedures and booking. If you have a question like that, just ask! You can also reach us at +92 21 3583 1234.\n\nThis AI provides informational guidance only and does not constitute formal attorney-client privilege. Please book a consultation with our advocates for formal legal representation.";
+
 /** Convert agent stream events into the plain-text delta wire format. */
 
 function refusalStream(ctx: TurnContext): Response {
-  const reply =
-    "I'm the Karachi Legal AI assistant for Rizvi Law Associates, so I can only help with legal-information questions about Pakistani law and this firm's services — fees, practice areas, procedures and booking. If you have a question like that, just ask! You can also reach us at +92 21 3583 1234.\n\nThis AI provides informational guidance only and does not constitute formal attorney-client privilege. Please book a consultation with our advocates for formal legal representation.";
-
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      for await (const chunk of demoStream(reply)) {
+      for await (const chunk of demoStream(GUARDRAIL_REFUSAL)) {
         controller.enqueue(chunk);
       }
       controller.close();
-      void logTurn(ctx.sessionId, ctx.lastUser, reply);
+      void logTurn(ctx.sessionId, ctx.lastUser, GUARDRAIL_REFUSAL);
     },
   });
 
@@ -91,7 +91,7 @@ async function liveChat(
   history: Array<{ role: "user" | "assistant"; content: string }>,
   ctx: TurnContext
 ): Promise<Response | null> {
-  if (!GEMINI_API_KEY) return null;
+  if (!GEMINI_API_KEY || history.length === 0) return null;
 
   // Lazily point the SDK at Gemini's endpoint (module-level init would
   // run at build time, where no credentials exist).
@@ -123,7 +123,25 @@ async function liveChat(
           }
           controller.close();
         } catch (err) {
-          console.error("[chat] Stream error:", err);
+          // Input guardrails can throw mid-stream (after the response has
+          // started). Nothing streamed yet → emit the refusal inline.
+          if (err instanceof InputGuardrailTripwireTriggered && !full) {
+            console.warn(
+              "[chat] Guardrail tripwire:",
+              JSON.stringify(err.result?.output?.outputInfo ?? {})
+            );
+            full = GUARDRAIL_REFUSAL;
+            controller.enqueue(encoder.encode(GUARDRAIL_REFUSAL));
+          } else {
+            console.error("[chat] Stream error:", err);
+            // Mid-stream upstream failure (quota, overload, network) after
+            // 200 headers are already sent — degrade to the keyword demo
+            // answer instead of leaving the user with silence.
+            if (!full) {
+              full = demoReply(ctx.lastUser);
+              controller.enqueue(encoder.encode(full));
+            }
+          }
           controller.close();
         } finally {
           void logTurn(ctx.sessionId, ctx.lastUser, full);
@@ -143,6 +161,25 @@ async function liveChat(
     console.error("[chat] Agent run failed:", err);
     return null;
   }
+}
+
+/** Remove empty/whitespace messages BEFORE validation — a failed stream can
+ * leave an empty assistant bubble in client history, which would otherwise
+ * fail Zod's min(1) and poison every later request with permanent 400s. */
+function stripEmptyMessages(body: unknown): unknown {
+  if (!body || typeof body !== "object") return body;
+  const { messages } = body as { messages?: unknown };
+  if (!Array.isArray(messages)) return body;
+  return {
+    ...(body as Record<string, unknown>),
+    messages: messages.filter(
+      (m) =>
+        m &&
+        typeof m === "object" &&
+        typeof (m as { content?: unknown }).content === "string" &&
+        ((m as { content: string }).content).trim().length > 0
+    ),
+  };
 }
 
 /* ── Route ─────────────────────────────────────────────────────────── */
@@ -167,11 +204,19 @@ export async function POST(req: Request): Promise<Response> {
   try {
     body = await req.json();
   } catch {
+    console.warn("[chat] invalid JSON body");
     return Response.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  const parsed = chatRequestSchema.safeParse(body);
+  const parsed = chatRequestSchema.safeParse(stripEmptyMessages(body));
   if (!parsed.success) {
+    console.warn(
+      "[chat] invalid request shape:",
+      parsed.error.issues
+        .slice(0, 3)
+        .map((i) => `${i.path.join(".")}: ${i.message}`)
+        .join("; ")
+    );
     return Response.json({ error: "Invalid request shape." }, { status: 400 });
   }
 

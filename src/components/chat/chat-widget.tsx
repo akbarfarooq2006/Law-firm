@@ -23,6 +23,9 @@ const GREETING: ChatMessage = {
     "Assalam-o-Alaikum. I'm the Karachi Legal AI assistant of Rizvi Law Associates.\n\nI can explain procedures for property transfers, Khula, succession certificates, bail, FBR notices and more — and help you book a consultation with our advocates.",
 };
 
+const STREAM_ERROR_TEXT =
+  "Sorry — I'm having trouble connecting right now. Please call us at +92 21 3583 1234 or try again shortly.";
+
 const QUICK_PROMPTS = [
   "What documents are needed for property transfer in Karachi?",
   "How do I file for a succession certificate?",
@@ -126,17 +129,25 @@ export function ChatWidget() {
             return next;
           });
         }
+
+        // Stream closed without error but produced no text — never leave an
+        // empty assistant bubble in history (it would fail validation on
+        // every later request).
+        setMessages((prev) => {
+          const next = [...prev];
+          const last = next[next.length - 1];
+          if (last?.role === "assistant" && !last.content.trim()) {
+            next[next.length - 1] = { ...last, content: STREAM_ERROR_TEXT };
+          }
+          return next;
+        });
       } catch (err) {
         if ((err as Error)?.name !== "AbortError") {
           setMessages((prev) => {
             const next = [...prev];
             const last = next[next.length - 1];
             if (last?.role === "assistant" && !last.content) {
-              next[next.length - 1] = {
-                ...last,
-                content:
-                  "Sorry — I'm having trouble connecting right now. Please call us at +92 21 3583 1234 or try again shortly.",
-              };
+              next[next.length - 1] = { ...last, content: STREAM_ERROR_TEXT };
             }
             return next;
           });
