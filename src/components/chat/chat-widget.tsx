@@ -11,6 +11,7 @@ import { ArrowUp, Bot, MessageCircle, Scale, X } from "lucide-react";
 import Link from "next/link";
 import { CHAT_OPEN_EVENT } from "@/lib/constants";
 import { cn } from "@/lib/utils";
+import { ChatMarkdown } from "./chat-markdown";
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -245,13 +246,19 @@ export function ChatWidget() {
                   )}
                   <div
                     className={cn(
-                      "max-w-[82%] whitespace-pre-wrap break-words rounded-2xl px-3.5 py-2.5 text-[13px] leading-relaxed",
+                      "max-w-[82%] break-words rounded-2xl px-3.5 py-2.5 text-[13px] leading-relaxed",
                       m.role === "user"
-                        ? "rounded-br-sm bg-navy-950 text-white"
-                        : "rounded-tl-sm border border-navy-100 bg-white text-navy-900 shadow-sm"
+                        ? "whitespace-pre-wrap rounded-br-sm bg-navy-950 text-white"
+                        : "rounded-tl-sm border border-navy-100 bg-white text-navy-900 shadow-sm [&>*:first-child]:mt-0"
                     )}
                   >
-                    {m.content || (
+                    {m.content ? (
+                      m.role === "assistant" ? (
+                        <ChatMarkdown content={m.content} />
+                      ) : (
+                        m.content
+                      )
+                    ) : (
                       <span className="flex gap-1 py-1" aria-label="Assistant is typing">
                         {[0, 150, 300].map((d) => (
                           <span
