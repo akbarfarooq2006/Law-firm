@@ -1,34 +1,12 @@
+import { run, user, assistant, InputGuardrailTripwireTriggered } from "@openai/agents";
+import { legalAssistantAgent } from "@/lib/agent";
+import { ensureAgentProvider } from "@/lib/agent/provider";
+import { GEMINI_API_KEY } from "@/lib/rag/config";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { chatRequestSchema } from "@/lib/validators";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-/* ── Persona & Guardrails ─────────────────────────────────────────── */
-
-const SYSTEM_PROMPT = `You are "Karachi Legal AI", the virtual legal assistant of Rizvi Law Associates (Advocates & Legal Consultants), Suite #402, Executive Towers, Block 5, Clifton, Karachi, Pakistan. The firm practices before the High Court of Sindh, City Courts Karachi, Malir Courts, Banking Courts Karachi and the Supreme Court of Pakistan (appellate).
-
-YOUR ROLE
-- Represent the firm accurately and professionally.
-- Provide GENERAL legal information under Pakistani federal law and Sindh provincial law only.
-- Explain common procedures step-by-step (property verification, Khula, succession certificates, bail, FBR/SRB notices, PECA complaints).
-- You may explain Urdu legal terms users mention (Wakala, Kula/Khula, Iqrarnama, Fard-e-Malkiat, Intiqal, Bayana, Zamanat).
-
-HARD LIMITS
-- Never claim an attorney-client relationship exists. Always include this exact disclaimer at the END of every reply, on its own line:
-"This AI provides informational guidance only and does not constitute formal attorney-client privilege. Please book a consultation with our advocates for formal legal representation."
-- Never guarantee outcomes, predict specific judgments, or quote case-law you are unsure about.
-- Never draft complete legal documents in chat; describe what they contain instead.
-- Do not advise on jurisdictions outside Pakistan; say it is outside your scope.
-- For emergencies (arrest, violence), tell users to call the firm immediately at +92 21 3583 1234 / WhatsApp +92 300 1234567.
-
-BOOKING INTENT
-If the user expresses intent to hire, consult, or book, warmly offer booking: consultations cost Rs. 5,000 for 30 minutes, held at the Clifton chamber or virtually, Mon–Sat 9:00 AM–7:00 PM PKT. Point them to the Contact page (/contact) or WhatsApp +92 300 1234567.
-
-STYLE
-- Warm, concise, professional. Default to English; mirror basic Urdu phrases where natural.
-- Use short bullet lists for document checklists and steps.
-- Keep answers under ~220 words.`;
 
 /* ── Rate limiting (best-effort, per-instance) ────────────────────── */
 
@@ -48,7 +26,7 @@ function rateLimited(ip: string): boolean {
   return bucket.count > MAX_REQUESTS;
 }
 
-/* ── Demo mode (no OPENAI_API_KEY configured) ─────────────────────── */
+/* ── Demo mode (no GEMINI_API_KEY configured) ─────────────────────── */
 
 function demoReply(prompt: string): string {
   const q = prompt.toLowerCase();
@@ -85,6 +63,88 @@ async function* demoStream(reply: string): AsyncGenerator<Uint8Array> {
   }
 }
 
+/* ── Live mode: Agents SDK → Gemini ───────────────────────────────── */
+
+type TurnContext = { sessionId: string; lastUser: string };
+
+/** Convert agent stream events into the plain-text delta wire format. */
+
+function refusalStream(ctx: TurnContext): Response {
+  const reply =
+    "I'm the Karachi Legal AI assistant for Rizvi Law Associates, so I can only help with legal-information questions about Pakistani law and this firm's services — fees, practice areas, procedures and booking. If you have a question like that, just ask! You can also reach us at +92 21 3583 1234.\n\nThis AI provides informational guidance only and does not constitute formal attorney-client privilege. Please book a consultation with our advocates for formal legal representation.";
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      for await (const chunk of demoStream(reply)) {
+        controller.enqueue(chunk);
+      }
+      controller.close();
+      void logTurn(ctx.sessionId, ctx.lastUser, reply);
+    },
+  });
+
+  return new Response(stream, { headers: responseHeaders() });
+}
+
+/** Returns null when Gemini isn't configured or the run fails (→ demo fallback). */
+async function liveChat(
+  history: Array<{ role: "user" | "assistant"; content: string }>,
+  ctx: TurnContext
+): Promise<Response | null> {
+  if (!GEMINI_API_KEY) return null;
+
+  // Lazily point the SDK at Gemini's endpoint (module-level init would
+  // run at build time, where no credentials exist).
+  ensureAgentProvider();
+
+  const input = history.map((m) =>
+    m.role === "user" ? user(m.content) : assistant(m.content)
+  );
+
+  try {
+    const result = await run(legalAssistantAgent, input, { stream: true });
+    const encoder = new TextEncoder();
+    let full = "";
+
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        try {
+          for await (const event of result) {
+            if (event.type !== "raw_model_stream_event") continue;
+            const data = event.data as { type?: string; delta?: unknown };
+            const delta =
+              data?.type === "output_text_delta" && typeof data.delta === "string"
+                ? data.delta
+                : "";
+            if (delta) {
+              full += delta;
+              controller.enqueue(encoder.encode(delta));
+            }
+          }
+          controller.close();
+        } catch (err) {
+          console.error("[chat] Stream error:", err);
+          controller.close();
+        } finally {
+          void logTurn(ctx.sessionId, ctx.lastUser, full);
+        }
+      },
+    });
+
+    return new Response(stream, { headers: responseHeaders() });
+  } catch (err) {
+    if (err instanceof InputGuardrailTripwireTriggered) {
+      console.warn(
+        "[chat] Guardrail tripwire:",
+        JSON.stringify(err.result?.output?.outputInfo ?? {})
+      );
+      return refusalStream(ctx);
+    }
+    console.error("[chat] Agent run failed:", err);
+    return null;
+  }
+}
+
 /* ── Route ─────────────────────────────────────────────────────────── */
 
 export async function POST(req: Request): Promise<Response> {
@@ -112,59 +172,27 @@ export async function POST(req: Request): Promise<Response> {
 
   const parsed = chatRequestSchema.safeParse(body);
   if (!parsed.success) {
-    return Response.json(
-      { error: "Invalid request shape." },
-      { status: 400 }
-    );
+    return Response.json({ error: "Invalid request shape." }, { status: 400 });
   }
 
   const sessionId = parsed.data.session_id ?? crypto.randomUUID();
   const history = parsed.data.messages.slice(-12);
   const lastUser =
     [...history].reverse().find((m) => m.role === "user")?.content ?? "";
+  const ctx: TurnContext = { sessionId, lastUser };
 
-  /* Live LLM mode */
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (apiKey) {
-    const baseUrl = process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
-    const model = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
-
-    try {
-      const upstream = await fetch(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          stream: true,
-          temperature: 0.3,
-          max_tokens: 600,
-          messages: [
-            { role: "system", content: SYSTEM_PROMPT },
-            ...history,
-          ],
-        }),
-      });
-
-      if (upstream.ok && upstream.body) {
-        return streamOpenAi(upstream.body, { sessionId, lastUser });
-      }
-      console.error("[chat] Upstream error:", upstream.status);
-    } catch (err) {
-      console.error("[chat] Upstream fetch failed:", err);
-    }
-  }
+  const liveResponse = await liveChat(history, ctx);
+  if (liveResponse) return liveResponse;
 
   /* Demo fallback — still streams */
+  const reply = demoReply(lastUser);
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      for await (const chunk of demoStream(demoReply(lastUser))) {
+      for await (const chunk of demoStream(reply)) {
         controller.enqueue(chunk);
       }
       controller.close();
-      void logTurn(sessionId, lastUser, demoReply(lastUser));
+      void logTurn(sessionId, lastUser, reply);
     },
   });
 
@@ -179,61 +207,6 @@ function responseHeaders(): HeadersInit {
     "Cache-Control": "no-store, no-transform",
     "X-Accel-Buffering": "no",
   };
-}
-
-/** Convert OpenAI SSE frames into a plain-text delta stream. */
-function streamOpenAi(
-  upstreamBody: ReadableStream<Uint8Array>,
-  ctx: { sessionId: string; lastUser: string }
-): Response {
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const reader = upstreamBody.getReader();
-      let buffer = "";
-      let full = "";
-
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() ?? "";
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith("data:")) continue;
-            const data = trimmed.slice(5).trim();
-            if (data === "[DONE]") continue;
-            try {
-              const json = JSON.parse(data) as {
-                choices?: Array<{ delta?: { content?: string | null } }>;
-              };
-              const delta = json.choices?.[0]?.delta?.content;
-              if (delta) {
-                full += delta;
-                controller.enqueue(encoder.encode(delta));
-              }
-            } catch {
-              // ignore partial/malformed frame
-            }
-          }
-        }
-        controller.close();
-      } catch (err) {
-        console.error("[chat] Stream error:", err);
-        controller.close();
-      } finally {
-        void logTurn(ctx.sessionId, ctx.lastUser, full);
-      }
-    },
-  });
-
-  return new Response(stream, { headers: responseHeaders() });
 }
 
 /* ── Analytics logging (best effort, service-role) ─────────────────── */

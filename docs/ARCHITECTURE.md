@@ -88,11 +88,31 @@ content up to 4,000 characters. The route keeps the last 12 messages, applies a 
 per-process IP limit of 30 requests per five minutes, and returns plain-text streaming
 chunks.
 
-When `OPENAI_API_KEY` is present, it forwards the conversation and system guardrails to
-`<OPENAI_BASE_URL>/chat/completions` with streaming enabled. The default base URL is
-`https://api.openai.com/v1`, and the default model is `gpt-4o-mini`. If the upstream request
-fails or no key exists, the route streams a local keyword-based response. Completed turns
-are logged best-effort to `chat_logs` through the service-role client.
+When `GEMINI_API_KEY` is present, the route runs an [OpenAI Agents SDK](https://openai.github.io/openai-agents-js/) agent
+(`src/lib/agent/`) pointed at Gemini's OpenAI-compatible endpoint
+(`https://generativelanguage.googleapis.com/v1beta/openai/`, Chat Completions mode, tracing disabled):
+
+- **Input guardrail** (`gemini-3.5-flash-lite` classifier) checks every turn for out-of-scope
+  requests and jailbreak/prompt-injection attempts before the main model runs; tripped requests
+  receive a canned refusal.
+- **Agent** (`gemini-3.6-flash`, thinking capped via `reasoning_effort: low`) carries the firm
+  persona, scope limits and disclaimer rules in its instructions, plus a `search_knowledge_base`
+  function tool that performs semantic search (RAG) over `knowledge_chunks` in Supabase pgvector.
+- Agent text deltas are re-emitted as plain-text streaming chunks; the wire format is unchanged.
+
+If the run fails or no key exists, the route streams a local keyword-based response. Completed
+turns are logged best-effort to `chat_logs` through the service-role client.
+
+### Knowledge base ingestion
+
+Markdown files in `knowledge-base/` are chunked by heading, embedded with `gemini-embedding-001`
+(explicitly requested at 1536 dimensions — must match `vector(1536)` in
+[`supabase/schema-vector.sql`](../supabase/schema-vector.sql)) and stored in Supabase via
+pgvector cosine similarity. Re-index after edits with:
+
+```bash
+npm run ingest
+```
 
 ## Configuration
 
@@ -104,10 +124,14 @@ must not be committed.
 | `NEXT_PUBLIC_SITE_URL` | No | Canonical site URL; defaults to `http://localhost:3000`. |
 | `NEXT_PUBLIC_SUPABASE_URL` | For persistence | Supabase project URL. Used by browser, server and admin clients. |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | For article reads | Supabase public anon key used by the server/browser clients. |
-| `SUPABASE_SERVICE_ROLE_KEY` | For form/chat persistence | Server-only key used by Server Actions and chat analytics. Never expose it to the browser. |
-| `OPENAI_API_KEY` | No | Enables live OpenAI-compatible chat. Missing key selects demo chat mode. |
-| `OPENAI_BASE_URL` | No | OpenAI-compatible API base; defaults to `https://api.openai.com/v1`. |
-| `OPENAI_MODEL` | No | Live chat model; defaults to `gpt-4o-mini`. |
+| `SUPABASE_SERVICE_ROLE_KEY` | For form/chat persistence | Server-only key used by Server Actions, chat analytics and RAG retrieval. Never expose it to the browser. |
+| `GEMINI_API_KEY` | No | Enables live agent chat. Missing key selects demo chat mode. |
+| `GEMINI_BASE_URL` | No | Gemini OpenAI-compatible base; defaults to `https://generativelanguage.googleapis.com/v1beta/openai/`. |
+| `GEMINI_MODEL` | No | Main chat model; defaults to `gemini-3.6-flash`. |
+| `GEMINI_GUARDRAIL_MODEL` | No | Guardrail classifier model; defaults to `gemini-3.5-flash-lite`. |
+| `GEMINI_EMBEDDING_MODEL` | No | Embedding model for RAG; defaults to `gemini-embedding-001`. |
+| `GEMINI_EMBEDDING_DIMENSIONS` | No | Embedding output size; defaults to `1536`. MUST match `knowledge_chunks.embedding` in schema-vector.sql. |
+| `GEMINI_REASONING_EFFORT` | No | Thinking level for the main model; defaults to `low` to cap hidden-token cost. |
 
 Supabase article reads require the URL and anon key. Consultation, inquiry and chat-log
 writes require the URL and service-role key. The application intentionally remains usable
@@ -122,6 +146,11 @@ Run [`supabase/schema.sql`](../supabase/schema.sql) in the Supabase SQL editor. 
 - `articles` for published and draft Markdown content.
 - `chat_logs` for anonymous assistant turns.
 - `admin_users` and the `is_admin()` helper for administrator access.
+
+For the chatbot's RAG knowledge base, also run
+[`supabase/schema-vector.sql`](../supabase/schema-vector.sql) (enables pgvector, creates
+`knowledge_chunks` with `vector(1536)` embeddings and the `match_knowledge_base` search RPC).
+Then index the markdown files: `npm run ingest`.
 
 The schema enables Row Level Security. Public clients can insert consultation requests,
 inquiries and chat log rows; only authenticated admins can read or modify operational data.
